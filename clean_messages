@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+"""
+第 2 步：把 messages.json 清洗成 R 能直接读的 CSV
+
+输出（都在 LP可视化 下的 data 文件夹里）：
+  messages_clean.csv   每条消息一行，含时间、发送人、类型、文字、各种派生字段
+  messages_notext.csv  同上但去掉所有文字内容（如需发给别人看结构时用）
+  events.csv           纪念日、生日等关键日期，用于图上标注
+  clean_summary.txt    清洗结果摘要（发给 Claude 核对用，不含聊天正文）
+
+运行：python -X utf8 clean_messages.py
+"""
+import csv
+import json
+import os
+import re
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+
+# ============ 路径 ============
+BASE = r"C:\Users\Administrator\Desktop\LP可视化"
+DIR = os.path.join(BASE, "LYQ")
+OUT = os.path.join(BASE, "data")
+os.makedirs(OUT, exist_ok=True)
+
+CONV = os.path.join(DIR, "conversations")
+conv_dir = os.path.join(CONV, os.listdir(CONV)[0])
+MSG_PATH = os.path.join(conv_dir, "messages.json")
+
+# ============ 参数 ============
+TZ = timezone(timedelta(hours=8))      # 北京时间
+SESSION_GAP_SEC = 3 * 3600             # 沉默超过 3 小时，算作一次新的对话
+DAY_START_HOUR = 5                     # “聊天日”从早上 5 点开始，凌晨聊天算前一天
+ME, HER = "我", "老婆"
+
+# 消息类型：英文 renderType -> 中文类别
+TYPE_MAP = {
+    "text": "文字", "quote": "文字",   # 引用回复本质上也是一条文字消息
+    "image": "图片", "emoji": "表情包", "voice": "语音", "video": "视频",
+    "voip": "通话", "link": "链接", "location": "位置", "transfer": "转账",
+    "redPacket": "红包", "file": "文件", "chatHistory": "聊天记录",
+    "system": "系统",
+}
+PAY_SUB = {"1": "发起转账", "3": "确认收款", "4": "退还"}
+
+# 系统消息归类
+def classify_system(content):
+    c = content or ""
+    if "撤回" in c:
+        return "撤回"
+    if "拍了拍" in c:
+        return "拍一拍"
+    if "朋友验证" in c or "开始聊天" in c:
+        return "加好友"
+    if "红包" in c:
+        return "红包提示"
+    return "其他系统"
+
+# 通话时长：从内容中提取 "12:34" 或 "1:02:03"
+CALL_DUR_RE = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
+def parse_call_sec(content):
+    m = CALL_DUR_RE.search(content or "")
+    if not m:
+        return ""
+    a, b, c = m.group(1), m.group(2), m.group(3)
+    return int(a) * 3600 + int(b) * 60 + int(c) if c else int(a) * 60 + int(b)
+
+def call_status(content):
+    c = content or ""
+    if CALL_DUR_RE.search(c):
+        return "接通"
+    if "其它设备" in c or "其他设备" in c:
+        return "其他设备接听"
+    for k in ("已取消", "取消"):
+        if k in c:
+            return "取消"
+    for k in ("拒绝", "已拒绝"):
+        if k in c:
+            return "拒绝"
+    for k in ("未接", "无应答", "对方无应答", "忙"):
+        if k in c:
+            return "未接通"
+    return "其他"
+
+# 去掉不可见控制字符，并把换行替换为空格，保证CSV每条消息只占一行
+CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u2028\u2029]")
+def clean_text(s):
+    s = CTRL_RE.sub("", s or "")
+    return s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+def to_float(v):
+    try:
+        return float(str(v).replace("¥", "").replace("￥", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return ""
+
+def to_num(v):
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return ""
+
+# ============ 读取 ============
+print("读取 messages.json ...")
+with open(MSG_PATH, encoding="utf-8") as f:
+    data = json.load(f)
+msgs = data["messages"]
+msgs.sort(key=lambda m: (m.get("createTime", 0), m.get("sortSeq", 0)))
+print(f"共 {len(msgs)} 条消息")
+
+# ============ 逐条清洗 ============
+rows = []
+prev_ts = None
+prev_sender = None
+session_id = 0
+turn_id = 0               # 连续同一人发的消息算一个“回合”
+for i, m in enumerate(msgs):
+    ts = int(m["createTime"])
+    dt = datetime.fromtimestamp(ts, TZ)
+    chat_day = (dt - timedelta(hours=DAY_START_HOUR)).date()
+    sender = ME if m.get("isSent") else HER
+    rtype = m.get("renderType", "")
+    cat = TYPE_MAP.get(rtype, rtype or "未知")
+    content = m.get("content") or ""
+    # 领红包的系统提示，归为“红包”类型
+    if rtype == "system" and "红包" in content:
+        cat = "红包"
+
+    # 文字内容：文字/引用用正文；语音用转写文字
+    text = ""
+    if cat == "文字":
+        text = clean_text(content)
+    voice_text = clean_text(m.get("voiceTranscript")) if rtype == "voice" else ""
+
+    gap = ts - prev_ts if prev_ts is not None else ""
+    new_session = prev_ts is None or gap > SESSION_GAP_SEC
+    if new_session:
+        session_id += 1
+    sender_switch = prev_sender is not None and sender != prev_sender
+    if prev_sender is None or sender_switch or new_session:
+        turn_id += 1
+    # 回复时间：对方发完后，我隔了多久回（同一次对话内才算）
+    reply_sec = gap if (sender_switch and not new_session) else ""
+
+    row = {
+        "idx": i + 1,
+        "ts": ts,
+        "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "date": dt.strftime("%Y-%m-%d"),
+        "chat_day": chat_day.isoformat(),
+        "year": dt.year,
+        "month": dt.strftime("%Y-%m"),
+        "hour": dt.hour,
+        "minute": dt.minute,
+        "weekday": dt.isoweekday(),          # 1=周一 … 7=周日
+        "sender": sender,
+        "type": cat,
+        "render_type": rtype,
+        "is_quote": int(rtype == "quote"),
+        "system_kind": classify_system(content) if rtype == "system" else "",
+        "text": text,
+        "char_len": len(text) if text else "",
+        "voice_sec": (round(to_num(m.get("voiceLength")) / 1000, 1)
+                      if rtype == "voice" and to_num(m.get("voiceLength")) != "" else ""),
+        "voice_text": voice_text,
+        "emoji_md5": m.get("emojiMd5", "") if rtype == "emoji" else "",
+        "call_type": m.get("voipType", "") if rtype == "voip" else "",
+        "call_status": call_status(content) if rtype == "voip" else "",
+        "call_sec": parse_call_sec(content) if rtype == "voip" else "",
+        "amount": to_float(m.get("amount")) if rtype in ("transfer", "redPacket") else "",
+        "pay_kind": PAY_SUB.get(str(m.get("paySubType", "")), "") if rtype == "transfer" else "",
+        "link_kind": m.get("linkType", "") if rtype == "link" else "",
+        "link_from": clean_text(m.get("from")) if rtype == "link" else "",
+        "location_name": clean_text(m.get("locationPoiname")) if rtype == "location" else "",
+        "gap_sec": gap,
+        "session_id": session_id,
+        "session_start": int(new_session),
+        "turn_id": turn_id,
+        "reply_sec": reply_sec,
+    }
+    rows.append(row)
+    prev_ts, prev_sender = ts, sender
+
+# 对话结束标记：下一条消息开启新会话，则本条是该会话最后一条
+for i, r in enumerate(rows):
+    r["session_end"] = int(i == len(rows) - 1 or rows[i + 1]["session_start"] == 1)
+
+# ============ 写 CSV ============
+fields = list(rows[0].keys())
+TEXT_FIELDS = {"text", "voice_text", "location_name"}
+
+def write_csv(path, cols):
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+write_csv(os.path.join(OUT, "messages_clean.csv"), fields)
+write_csv(os.path.join(OUT, "messages_notext.csv"), [c for c in fields if c not in TEXT_FIELDS])
+
+# ============ 关键日期 ============
+events = [
+    ("2023-03-31", "相识", "milestone"),
+    ("2025-06-07", "领证", "milestone"),
+    ("2025-10-07", "婚礼", "milestone"),
+]
+# 她的生日：阳历 10.17；农历九月初六（已换算为公历）
+for y in (2023, 2024, 2025, 2026):
+    events.append((f"{y}-10-17", "老婆生日(阳历)", "birthday"))
+for d in ("2023-10-20", "2024-10-08", "2025-10-26", "2026-10-15"):
+    events.append((d, "老婆生日(农历九月初六)", "birthday"))
+# 常见节日
+holidays = {
+    "情人节": ["2024-02-14", "2025-02-14", "2026-02-14"],
+    "520": ["2023-05-20", "2024-05-20", "2025-05-20", "2026-05-20"],
+    "七夕": ["2023-08-22", "2024-08-10", "2025-08-29", "2026-08-19"],
+    "除夕": ["2024-02-09", "2025-01-28", "2026-02-16"],
+    "中秋": ["2023-09-29", "2024-09-17", "2025-10-06", "2026-09-25"],
+}
+for name, ds in holidays.items():
+    for d in ds:
+        events.append((d, name, "holiday"))
+events.sort()
+with open(os.path.join(OUT, "events.csv"), "w", encoding="utf-8-sig", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["date", "label", "kind"])
+    w.writerows(events)
+
+# ============ 摘要（不含正文，发给 Claude 核对） ============
+def mask(s, n=25):
+    """把数字替换成 #，只保留格式，避免泄露具体内容"""
+    s = re.sub(r"\d", "#", s or "")
+    return s[:n] + ("…" if len(s) > n else "")
+
+lines = []
+P = lines.append
+P(f"总消息数: {len(rows)}")
+P(f"时间范围: {rows[0]['datetime']} ~ {rows[-1]['datetime']}")
+P(f"发送人: {dict(Counter(r['sender'] for r in rows))}")
+P(f"\n消息类型:\n{Counter(r['type'] for r in rows).most_common()}")
+P(f"\n系统消息细分: {Counter(r['system_kind'] for r in rows if r['type']=='系统').most_common()}")
+P(f"\n对话会话数(间隔>{SESSION_GAP_SEC//3600}h): {session_id}")
+P(f"有消息的聊天日数: {len(set(r['chat_day'] for r in rows))}")
+
+voip = [m for m in msgs if m.get("renderType") == "voip"]
+P(f"\n通话: {len(voip)} 次; 类型 {Counter(r['call_type'] for r in rows if r['type']=='通话')}")
+P(f"通话状态: {Counter(r['call_status'] for r in rows if r['type']=='通话')}")
+P("通话内容格式样例(数字已打码):")
+for s, c in Counter(mask(m.get('content')) for m in voip).most_common(12):
+    P(f"   {c:>5}  {s}")
+
+tr = [r for r in rows if r["type"] in ("转账", "红包")]
+P(f"\n转账/红包: {len(tr)} 条; 有金额的 {sum(1 for r in tr if r['amount'] != '')} 条")
+P(f"转账类别: {Counter(r['pay_kind'] for r in tr)}")
+P("金额字段格式样例(已打码): " + str([mask(str(m.get('amount')), 12)
+    for m in msgs if m.get('renderType') in ('transfer', 'redPacket')][:5]))
+
+vo = [r for r in rows if r["type"] == "语音"]
+P(f"\n语音: {len(vo)} 条; 有时长 {sum(1 for r in vo if r['voice_sec'] != '')} 条; "
+  f"有转写文字 {sum(1 for r in vo if r['voice_text'])} 条")
+P("语音时长字段样例: " + str([m.get('voiceLength') for m in msgs if m.get('renderType') == 'voice'][:5]))
+
+tx = [r for r in rows if r["type"] == "文字"]
+P(f"\n文字消息: {len(tx)} 条; 其中引用回复 {sum(r['is_quote'] for r in tx)} 条")
+for s in (ME, HER):
+    lens = sorted(r["char_len"] for r in tx if r["sender"] == s)
+    if lens:
+        P(f"  {s}: {len(lens)} 条, 字数中位数 {lens[len(lens)//2]}, 总字数 {sum(lens)}")
+
+rep = [r for r in rows if r["reply_sec"] != ""]
+for s in (ME, HER):
+    v = sorted(r["reply_sec"] for r in rep if r["sender"] == s)
+    if v:
+        P(f"  {s} 回复间隔中位数: {v[len(v)//2]} 秒 (n={len(v)})")
+
+P(f"\n链接来源前10: {Counter(r['link_from'] or r['link_kind'] for r in rows if r['type']=='链接').most_common(10)}")
+P(f"\n每年消息数: {sorted(Counter(r['year'] for r in rows).items())}")
+
+with open(os.path.join(OUT, "clean_summary.txt"), "w", encoding="utf-8") as f:
+    f.write("\n".join(lines))
+print("\n".join(lines))
+print(f"\n完成！文件已保存到: {OUT}")
